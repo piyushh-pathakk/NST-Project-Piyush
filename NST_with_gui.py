@@ -1,4 +1,4 @@
-import utils as utils
+import utils
 from video_utils import create_video_from_intermediate_results
 
 import torch
@@ -8,13 +8,15 @@ import numpy as np
 import os
 import argparse
 
+import streamlit as st
+import tempfile
+import cv2
 
 def build_loss(neural_net, optimizing_img, target_representations, content_feature_maps_index, style_feature_maps_indices, config):
     target_content_representation = target_representations[0]
     target_style_representation = target_representations[1]
 
     current_set_of_feature_maps = neural_net(optimizing_img)
-
     current_content_representation = current_set_of_feature_maps[content_feature_maps_index].squeeze(axis=0)
     content_loss = torch.nn.MSELoss(reduction='mean')(target_content_representation, current_content_representation)
 
@@ -30,21 +32,14 @@ def build_loss(neural_net, optimizing_img, target_representations, content_featu
 
     return total_loss, content_loss, style_loss, tv_loss
 
-
 def make_tuning_step(neural_net, optimizer, target_representations, content_feature_maps_index, style_feature_maps_indices, config):
-    # Builds function that performs a step in the tuning loop
     def tuning_step(optimizing_img):
         total_loss, content_loss, style_loss, tv_loss = build_loss(neural_net, optimizing_img, target_representations, content_feature_maps_index, style_feature_maps_indices, config)
-        # Computes gradients
         total_loss.backward()
-        # Updates parameters and zeroes gradients
         optimizer.step()
         optimizer.zero_grad()
         return total_loss, content_loss, style_loss, tv_loss
-
-    # Returns the function that will be called inside the tuning loop
     return tuning_step
-
 
 def neural_style_transfer(config):
     content_img_path = os.path.join(config['content_images_dir'], config['content_img_name'])
@@ -60,18 +55,14 @@ def neural_style_transfer(config):
     style_img = utils.prepare_img(style_img_path, config['height'], device)
 
     if config['init_method'] == 'random':
-        # white_noise_img = np.random.uniform(-90., 90., content_img.shape).astype(np.float32)
         gaussian_noise_img = np.random.normal(loc=0, scale=90., size=content_img.shape).astype(np.float32)
         init_img = torch.from_numpy(gaussian_noise_img).float().to(device)
     elif config['init_method'] == 'content':
         init_img = content_img
     else:
-        # init image has same dimension as content image - this is a hard constraint
-        # feature maps need to be of same size for content image and init image
         style_img_resized = utils.prepare_img(style_img_path, np.asarray(content_img.shape[2:]), device)
         init_img = style_img_resized
 
-    # we are tuning optimizing_img's pixels! (that's why requires_grad=True)
     optimizing_img = Variable(init_img, requires_grad=True)
 
     neural_net, content_feature_maps_index_name, style_feature_maps_indices_names = utils.prepare_model(config['model'], device)
@@ -84,28 +75,22 @@ def neural_style_transfer(config):
     target_style_representation = [utils.gram_matrix(x) for cnt, x in enumerate(style_img_set_of_feature_maps) if cnt in style_feature_maps_indices_names[0]]
     target_representations = [target_content_representation, target_style_representation]
 
-    # magic numbers in general are a big no no - some things in this code are left like this by design to avoid clutter
     num_of_iterations = {
         "lbfgs": 1000,
         "adam": 3000,
     }
 
-    #
-    # Start of optimization procedure
-    #
     if config['optimizer'] == 'adam':
         optimizer = Adam((optimizing_img,), lr=1e1)
         tuning_step = make_tuning_step(neural_net, optimizer, target_representations, content_feature_maps_index_name[0], style_feature_maps_indices_names[0], config)
         for cnt in range(num_of_iterations[config['optimizer']]):
             total_loss, content_loss, style_loss, tv_loss = tuning_step(optimizing_img)
             with torch.no_grad():
-                print(f'Adam | iteration: {cnt:03}, total loss={total_loss.item():12.4f}, content_loss={config["content_weight"] * content_loss.item():12.4f}, style loss={config["style_weight"] * style_loss.item():12.4f}, tv loss={config["tv_weight"] * tv_loss.item():12.4f}')
+                print(f'Adam | iteration: {cnt:03}, total loss={total_loss.item():12.4f}')
                 utils.save_and_maybe_display(optimizing_img, dump_path, config, cnt, num_of_iterations[config['optimizer']], should_display=False)
     elif config['optimizer'] == 'lbfgs':
-        # line_search_fn does not seem to have significant impact on result
         optimizer = LBFGS((optimizing_img,), max_iter=num_of_iterations['lbfgs'], line_search_fn='strong_wolfe')
         cnt = 0
-
         def closure():
             nonlocal cnt
             if torch.is_grad_enabled():
@@ -114,56 +99,72 @@ def neural_style_transfer(config):
             if total_loss.requires_grad:
                 total_loss.backward()
             with torch.no_grad():
-                print(f'L-BFGS | iteration: {cnt:03}, total loss={total_loss.item():12.4f}, content_loss={config["content_weight"] * content_loss.item():12.4f}, style loss={config["style_weight"] * style_loss.item():12.4f}, tv loss={config["tv_weight"] * tv_loss.item():12.4f}')
+                print(f'L-BFGS | iteration: {cnt:03}, total loss={total_loss.item():12.4f}')
                 utils.save_and_maybe_display(optimizing_img, dump_path, config, cnt, num_of_iterations[config['optimizer']], should_display=False)
-
             cnt += 1
             return total_loss
-
         optimizer.step(closure)
 
     return dump_path
 
+def run_gui():
+    st.set_page_config(page_title="Neural Style Transfer", layout="wide")
+    st.title("🎨 Neural Style Transfer - Echo Style")
+
+    content_file = st.file_uploader("Upload Content Image", type=["jpg", "png"])
+    style_file = st.file_uploader("Upload Style Image", type=["jpg", "png"])
+
+    model = st.selectbox("Model", ["vgg19", "vgg16"])
+    optimizer = st.selectbox("Optimizer", ["adam", "lbfgs"])
+    init_method = st.selectbox("Initialization Method", ["random", "content", "style"])
+
+    height = st.slider("Image Height", 256, 800, 400, step=64)
+    cw = st.number_input("Content Weight", value=1e5)
+    sw = st.number_input("Style Weight", value=3e4)
+    tvw = st.number_input("Total Variation Weight", value=1.0)
+
+    if content_file and style_file and st.button("Generate Stylized Image"):
+        with tempfile.TemporaryDirectory() as td:
+            cpath = os.path.join(td, "content.jpg")
+            spath = os.path.join(td, "style.jpg")
+            with open(cpath, "wb") as f: f.write(content_file.read())
+            with open(spath, "wb") as f: f.write(style_file.read())
+
+            st.image(cpath, caption="Content Image", use_column_width=True)
+            st.image(spath, caption="Style Image", use_column_width=True)
+
+            config = {
+                "content_img_name": "content.jpg",
+                "style_img_name": "style.jpg",
+                "content_images_dir": td,
+                "style_images_dir": td,
+                "output_img_dir": td,
+                "img_format": (4, ".jpg"),
+                "height": height,
+                "content_weight": cw,
+                "style_weight": sw,
+                "tv_weight": tvw,
+                "optimizer": optimizer,
+                "model": model,
+                "init_method": init_method,
+                "saving_freq": -1
+            }
+
+            st.info("Running style transfer… this may take a few minutes ⏳")
+            torch.cuda.empty_cache()
+            out_dir = neural_style_transfer(config)
+
+            files = sorted(os.listdir(out_dir))
+            last = files[-1]
+            img = cv2.imread(os.path.join(out_dir, last))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            st.image(img, caption="🎉 Stylized Output", use_column_width=True)
 
 if __name__ == "__main__":
-    #
-    # fixed args - don't change these unless you have a good reason
-    #
-    default_resource_dir = os.path.join(os.path.dirname(__file__), 'data')
-    content_images_dir = os.path.join(default_resource_dir, 'content-images')
-    style_images_dir = os.path.join(default_resource_dir, 'style-images')
-    output_img_dir = os.path.join(default_resource_dir, 'output-images')
-    img_format = (4, '.jpg')  # saves images in the format: %04d.jpg
-
-    #
-    # modifiable args - feel free to play with these (only small subset is exposed by design to avoid cluttering)
-    # sorted so that the ones on the top are more likely to be changed than the ones on the bottom
-    #
     parser = argparse.ArgumentParser()
-    parser.add_argument("--content_img_name", type=str, help="content image name", default='house.jpg')
-    parser.add_argument("--style_img_name", type=str, help="style image name", default='starry_night.jpg')
-    parser.add_argument("--height", type=int, help="height of content and style images", default=400)
-
-    parser.add_argument("--content_weight", type=float, help="weight factor for content loss", default=1e5)
-    parser.add_argument("--style_weight", type=float, help="weight factor for style loss", default=3e4)
-    parser.add_argument("--tv_weight", type=float, help="weight factor for total variation loss", default=1e0)
-
-    parser.add_argument("--optimizer", type=str, choices=['lbfgs', 'adam'], default='lbfgs')
-    parser.add_argument("--model", type=str, choices=['vgg16', 'vgg19'], default='vgg19')
-    parser.add_argument("--init_method", type=str, choices=['random', 'content', 'style'], default='content')
-    parser.add_argument("--saving_freq", type=int, help="saving frequency for intermediate images (-1 means only final)", default=-1)
-    args = parser.parse_args()
-
-    # just wrapping settings into a dictionary
-    optimization_config = dict()
-    for arg in vars(args):
-        optimization_config[arg] = getattr(args, arg)
-    optimization_config['content_images_dir'] = content_images_dir
-    optimization_config['style_images_dir'] = style_images_dir
-    optimization_config['output_img_dir'] = output_img_dir
-    optimization_config['img_format'] = img_format
-
-    # original NST (Neural Style Transfer) algorithm (Gatys et al.)
-    results_path = neural_style_transfer(optimization_config)
-
-     
+    parser.add_argument("--gui", action="store_true", help="Run Streamlit GUI")
+    args, _ = parser.parse_known_args()
+    if args.gui:
+        run_gui()
+    else:
+        print("Please run with --gui to launch the interface")
